@@ -1,11 +1,15 @@
 package core
 
 import (
+	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/gastrodon/psyduck/parse"
+	"github.com/hashicorp/hcl/v2"
 	"github.com/psyduck-etl/sdk"
 	"github.com/sirupsen/logrus"
 )
@@ -13,13 +17,14 @@ import (
 type Values func() (int, int)
 
 type testPipelineCase struct {
-	DataCount     int
-	Delay         bool
-	ProducerCount int
-	ConsumerCount int
+	DataCount        int
+	Delay            bool
+	ProducerCount    int
+	ConsumerCount    int
+	ProducerParallel uint
 }
 
-func makeTestProducer(testcase testPipelineCase) (sdk.Producer, func() []int) {
+func makeTestProducer(testcase testPipelineCase) (func() <-chan result[sdk.Producer], func() []int) {
 	counts := make([]int, testcase.ProducerCount)
 	producers := make([]sdk.Producer, testcase.ProducerCount)
 
@@ -40,7 +45,14 @@ func makeTestProducer(testcase testPipelineCase) (sdk.Producer, func() []int) {
 		}(index)
 	}
 
-	return joinProducers(producers, pipelineLogger()), func() []int { return counts }
+	return func() <-chan result[sdk.Producer] {
+		c := make(chan result[sdk.Producer], len(producers))
+		for _, p := range producers {
+			c <- ok(p)
+		}
+		close(c)
+		return c
+	}, func() []int { return counts }
 }
 
 func makeTestConsumer(testcase testPipelineCase) (sdk.Consumer, func() []int) {
@@ -79,9 +91,11 @@ func testPipeline(testcase testPipelineCase) error {
 	}
 
 	pipeline := &Pipeline{
-		Producer:    producer,
-		Consumer:    consumer,
-		Transformer: transformer,
+		Producer:          producer,
+		Consumer:          consumer,
+		Transformer:       transformer,
+		logger:            pipelineLogger(),
+		ParallelProducers: testcase.ProducerParallel,
 	}
 
 	if err := RunPipeline(pipeline); err != nil {
@@ -114,12 +128,16 @@ func Test_RunPipeline(test *testing.T) {
 	)
 
 	cases := []testPipelineCase{
-		{COUNT_DELAY, true, 1, 1},
-		{COUNT_DELAY, true, 10, 10},
-		{COUNT_IMMEDIATE, false, 1, 1},
-		{COUNT_IMMEDIATE, false, 1, 10},
-		{COUNT_IMMEDIATE, false, 10, 1},
-		{COUNT_IMMEDIATE, false, 10, 10},
+		{COUNT_DELAY, true, 1, 1, 0},
+		{COUNT_DELAY, true, 10, 10, 0},
+		{COUNT_IMMEDIATE, false, 1, 1, 0},
+		{COUNT_IMMEDIATE, false, 1, 10, 0},
+		{COUNT_IMMEDIATE, false, 10, 1, 0},
+		{COUNT_IMMEDIATE, false, 10, 10, 0},
+		{COUNT_IMMEDIATE, false, 10, 1, 4},
+		{COUNT_IMMEDIATE, false, 10, 10, 4},
+		{COUNT_IMMEDIATE, false, 10, 1, 20},
+		{COUNT_IMMEDIATE, false, 10, 10, 20},
 	}
 
 	for i, testcase := range cases {
@@ -136,11 +154,16 @@ func Test_RunPipeline(test *testing.T) {
 func Test_RunPipeline_filtering(test *testing.T) {
 	received, limit, fac := byte(0), byte(100), byte(2)
 	testcase := &Pipeline{
-		Producer: func(send chan<- []byte, errs chan<- error) {
-			for i := byte(0); i < limit; i++ {
-				send <- []byte{i}
-			}
-			close(send)
+		Producer: func() <-chan result[sdk.Producer] {
+			c := make(chan result[sdk.Producer], 1)
+			c <- ok[sdk.Producer](func(send chan<- []byte, errs chan<- error) {
+				for i := byte(0); i < limit; i++ {
+					send <- []byte{i}
+				}
+				close(send)
+			})
+			close(c)
+			return c
 		},
 		Consumer: func(recv <-chan []byte, errs chan<- error, done chan<- struct{}) {
 			for range recv {
@@ -167,6 +190,113 @@ func Test_RunPipeline_filtering(test *testing.T) {
 	}
 }
 
+func drawDiags(d hcl.Diagnostics) string {
+	buf := make([]string, len(d))
+	for i, diag := range d {
+		buf[i] = diag.Error()
+	}
+
+	return strings.Join(buf, "\n")
+}
+
+func Test_RunPipeline_remote(t *testing.T) {
+	pin := &sdk.Plugin{
+		Name: "test",
+		Resources: []*sdk.Resource{
+			{
+				Kinds: sdk.PRODUCER,
+				Name:  "mono",
+				Spec:  []*sdk.Spec{},
+				ProvideProducer: func(parse sdk.Parser) (sdk.Producer, error) {
+					cfg := new(struct {
+						V byte `cty:"v"`
+					})
+
+					if err := parse(cfg); err != nil {
+						return nil, err
+					}
+
+					return func(send chan<- []byte, errs chan<- error) {
+						send <- []byte{cfg.V}
+						close(send)
+					}, nil
+				},
+			},
+			{
+				Kinds: sdk.PRODUCER,
+				Name:  "meta",
+				Spec:  []*sdk.Spec{},
+				ProvideProducer: func(parse sdk.Parser) (sdk.Producer, error) {
+					cfg := new(struct {
+						V byte `cty:"v"`
+						C int  `cty:"c"`
+					})
+
+					if err := parse(cfg); err != nil {
+						return nil, err
+					}
+
+					return func(send chan<- []byte, errs chan<- error) {
+						for i := 0; i < cfg.C; i++ {
+							send <- []byte(fmt.Sprintf(`
+							produce "mono" {
+								v = %d
+							}`, cfg.V))
+						}
+						close(send)
+					}, nil
+				},
+			},
+		},
+	}
+
+	lib := NewLibrary([]*sdk.Plugin{pin})
+
+	group, diags := parse.NewFile("test-remote-producers", []byte(`
+	produce-from "meta" {
+		v = 100
+		c = 5
+	}
+
+	produce-from "meta" {
+		v = 50
+		c = 10
+	}`)).Pipelines(lib.Ctx())
+	if diags.HasErrors() {
+		t.Fatalf("failed to parse: %s", drawDiags(diags))
+	}
+
+	pline, err := BuildPipeline(group.Monify(), lib)
+	if err != nil {
+		t.Fatalf("failed to build: %s", err)
+	}
+
+	tabs := make(map[byte]int, 2)
+	alt := pline.Transformer
+	pline.Transformer = func(in []byte) ([]byte, error) {
+		if v, ok := tabs[in[0]]; ok {
+			tabs[in[0]] = v + 1
+		} else {
+			tabs[in[0]] = 1
+		}
+
+		return alt(in)
+	}
+
+	if err := RunPipeline(pline); err != nil {
+		t.Fatalf("failed to run: %s", err)
+	}
+
+	if tabs[100] != 5 {
+		t.Fatalf("tabs[100] mismatch: 5 != %d", tabs[100])
+	}
+
+	if tabs[50] != 10 {
+		t.Fatalf("tabs[50] mismatch: 10 != %d", tabs[50])
+
+	}
+}
+
 type testHook struct {
 	fn func()
 }
@@ -188,13 +318,18 @@ func pipelineTestLogger(fn func()) *logrus.Logger {
 
 func Test_RunPipeline_error(test *testing.T) {
 	errText := "error made"
-	produceErr := func(n int) sdk.Producer {
-		return func(send chan<- []byte, errs chan<- error) {
-			for i := 0; i < n; i++ {
-				send <- []byte{0}
-			}
+	produceErr := func(n int) func() <-chan result[sdk.Producer] {
+		return func() <-chan result[sdk.Producer] {
+			c := make(chan result[sdk.Producer], 1)
+			c <- ok[sdk.Producer](func(send chan<- []byte, errs chan<- error) {
+				for i := 0; i < n; i++ {
+					send <- []byte{0}
+				}
 
-			errs <- fmt.Errorf(errText)
+				errs <- errors.New(errText)
+			})
+			close(c)
+			return c
 		}
 	}
 
@@ -204,7 +339,7 @@ func Test_RunPipeline_error(test *testing.T) {
 				<-recv
 			}
 
-			errs <- fmt.Errorf(errText)
+			errs <- errors.New(errText)
 		}
 	}
 
@@ -212,7 +347,7 @@ func Test_RunPipeline_error(test *testing.T) {
 		i := 0
 		return func(in []byte) ([]byte, error) {
 			if i >= n {
-				return nil, fmt.Errorf(errText)
+				return nil, errors.New(errText)
 			}
 			i++
 			return in, nil
@@ -242,7 +377,13 @@ func Test_RunPipeline_error(test *testing.T) {
 			ExitOnError: true,
 		}, fmt.Errorf("transformer supplied error: %s", errText)},
 		{&Pipeline{
-			Producer:    joinProducers([]sdk.Producer{produceErr(50), produceErr(math.MaxInt32)}, logrus.StandardLogger()),
+			Producer: func() <-chan result[sdk.Producer] {
+				c := make(chan result[sdk.Producer], 2)
+				c <- <-produceErr(50)()
+				c <- <-produceErr(math.MaxInt32)() // this is silly code!
+				close(c)
+				return c
+			},
 			Consumer:    consumeErr(math.MaxInt32),
 			Transformer: transformeErr(math.MaxInt32),
 			ExitOnError: true,
